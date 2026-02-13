@@ -1,3 +1,5 @@
+import os
+import random
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -8,8 +10,12 @@ from bs4 import BeautifulSoup, Tag
 
 
 class NaverStockNewsCrawler:
+    """
+    Naver finance item-news crawler.
+    This source can return empty results depending on page state.
+    """
+
     def __init__(self):
-        # 요청 차단을 줄이기 위한 브라우저 헤더
         self.headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -23,9 +29,6 @@ class NaverStockNewsCrawler:
         }
 
     def get_stock_news(self, stock_code: str, max_count: int = 10) -> List[Dict[str, str]]:
-        """
-        특정 종목의 최신 뉴스를 크롤링합니다.
-        """
         try:
             print(f"[크롤링 시작] 종목코드: {stock_code}")
 
@@ -43,7 +46,7 @@ class NaverStockNewsCrawler:
                 return []
 
             rows = news_table.find_all("tr")
-            for i, row in enumerate(rows):
+            for idx, row in enumerate(rows):
                 if len(news_list) >= max_count:
                     break
 
@@ -56,7 +59,7 @@ class NaverStockNewsCrawler:
                     continue
 
                 date_cell = row.find("td", {"class": "date"})
-                date_text = date_cell.get_text(strip=True) if date_cell else "날짜 정보 없음"
+                date_text = date_cell.get_text(strip=True) if date_cell else "시간 정보 없음"
 
                 info_cell = row.find("td", {"class": "info"})
                 source_text = info_cell.get_text(strip=True) if info_cell else "출처 정보 없음"
@@ -67,7 +70,7 @@ class NaverStockNewsCrawler:
                     link = "https://finance.naver.com" + link
 
                 news_item = {
-                    "id": f"{stock_code}_{i}_{int(time.time())}",
+                    "id": f"{stock_code}_{idx}_{int(time.time())}",
                     "title": title,
                     "link": link,
                     "source": source_text,
@@ -88,22 +91,16 @@ class NaverStockNewsCrawler:
             return []
 
     def get_multiple_stocks_news(self, stock_codes: List[str], max_each: int = 5) -> Dict[str, List[Dict[str, str]]]:
-        """
-        여러 종목의 뉴스를 한 번에 가져옵니다.
-        """
         results: Dict[str, List[Dict[str, str]]] = {}
-
         for stock_code in stock_codes:
             results[stock_code] = self.get_stock_news(stock_code, max_each)
-            time.sleep(1)  # 요청 간격(크롤링 예의)
-
+            time.sleep(1.0)
         return results
 
 
 class NaverNewsSearchCrawler:
     """
-    네이버 뉴스 검색 기반 크롤러.
-    기존 a.news_tit 셀렉터가 사라져 data-heatmap-target='.tit' 셀렉터를 사용합니다.
+    Naver news-search crawler with retry/backoff + cache for stability.
     """
 
     def __init__(self):
@@ -114,18 +111,181 @@ class NaverNewsSearchCrawler:
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
             "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+            "Referer": "https://search.naver.com/",
+        }
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+
+        self.max_retries = 3
+        self.base_backoff = 0.8
+        self.min_request_interval_sec = float(os.getenv("NAVER_MIN_REQUEST_INTERVAL_SEC", "0.9"))
+        self.cache_ttl_sec = int(os.getenv("NEWS_CACHE_TTL_SEC", "180"))
+
+        self._last_request_ts = 0.0
+        self._cache: Dict[str, Dict[str, object]] = {}
+        self._last_result_meta: Dict[str, Dict[str, object]] = {}
+        self._runtime_stats: Dict[str, int] = {
+            "requests_total": 0,
+            "request_failures": 0,
+            "network_fetches": 0,
+            "cache_hits": 0,
+            "stale_cache_hits": 0,
+            "empty_results": 0,
+            "exceptions": 0,
         }
 
+    def get_last_result_meta(self, keyword: str) -> Dict[str, object]:
+        """
+        Example:
+        {
+          "source": "network|cache|stale_cache|empty",
+          "age_sec": 1.2,
+          "fetched_at": "YYYY-mm-dd HH:MM:SS",
+          "cache_ttl_sec": 180
+        }
+        """
+        return dict(self._last_result_meta.get(keyword, {}))
+
+    def get_runtime_metrics(self) -> Dict[str, object]:
+        now = time.time()
+        cache_entries = len(self._cache)
+        valid_cache_entries = 0
+        stale_cache_entries = 0
+
+        for entry in self._cache.values():
+            fetched_at = float(entry.get("fetched_at", 0.0))
+            if fetched_at <= 0:
+                stale_cache_entries += 1
+                continue
+            if now - fetched_at <= self.cache_ttl_sec:
+                valid_cache_entries += 1
+            else:
+                stale_cache_entries += 1
+
+        last_request_age_sec = None
+        if self._last_request_ts > 0:
+            last_request_age_sec = round(max(0.0, now - self._last_request_ts), 2)
+
+        return {
+            "cache_ttl_sec": self.cache_ttl_sec,
+            "min_request_interval_sec": self.min_request_interval_sec,
+            "cache_entries": cache_entries,
+            "valid_cache_entries": valid_cache_entries,
+            "stale_cache_entries": stale_cache_entries,
+            "tracked_keywords": len(self._last_result_meta),
+            "last_request_age_sec": last_request_age_sec,
+            "stats": dict(self._runtime_stats),
+        }
+
+    def _cache_key(self, keyword: str, max_count: int) -> str:
+        return f"{keyword}::{max_count}"
+
+    def _set_last_meta(self, keyword: str, source: str, fetched_at: float):
+        age_sec = max(0.0, time.time() - fetched_at)
+        self._last_result_meta[keyword] = {
+            "source": source,
+            "age_sec": round(age_sec, 2),
+            "fetched_at": datetime.fromtimestamp(fetched_at).strftime("%Y-%m-%d %H:%M:%S"),
+            "cache_ttl_sec": self.cache_ttl_sec,
+        }
+
+    def _get_cached_news(self, keyword: str, max_count: int) -> Optional[Tuple[List[Dict[str, str]], float]]:
+        key = self._cache_key(keyword, max_count)
+        entry = self._cache.get(key)
+        if not entry:
+            return None
+
+        news = entry.get("data", [])
+        fetched_at = float(entry.get("fetched_at", 0.0))
+        if not isinstance(news, list) or fetched_at <= 0:
+            return None
+
+        age_sec = time.time() - fetched_at
+        if age_sec > self.cache_ttl_sec:
+            return None
+
+        return ([dict(item) for item in news], fetched_at)
+
+    def _get_stale_cached_news(self, keyword: str, max_count: int) -> Optional[Tuple[List[Dict[str, str]], float]]:
+        key = self._cache_key(keyword, max_count)
+        entry = self._cache.get(key)
+        if not entry:
+            return None
+
+        news = entry.get("data", [])
+        fetched_at = float(entry.get("fetched_at", 0.0))
+        if not isinstance(news, list) or fetched_at <= 0:
+            return None
+
+        return ([dict(item) for item in news], fetched_at)
+
+    def _set_cache(self, keyword: str, max_count: int, news_list: List[Dict[str, str]]):
+        key = self._cache_key(keyword, max_count)
+        self._cache[key] = {
+            "fetched_at": time.time(),
+            "data": [dict(item) for item in news_list],
+        }
+
+    def _throttle(self):
+        now = time.time()
+        elapsed = now - self._last_request_ts
+        if elapsed < self.min_request_interval_sec:
+            time.sleep(self.min_request_interval_sec - elapsed)
+        self._last_request_ts = time.time()
+
+    def _request_search(self, keyword: str) -> Optional[requests.Response]:
+        url = "https://search.naver.com/search.naver"
+        params = {"where": "news", "sm": "tab_opt", "query": keyword}
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                self._throttle()
+                self._runtime_stats["requests_total"] += 1
+                response = self.session.get(url, params=params, timeout=15)
+                response.raise_for_status()
+                return response
+            except requests.RequestException as e:
+                self._runtime_stats["request_failures"] += 1
+                last_error = e
+                status_code = getattr(getattr(e, "response", None), "status_code", None)
+                should_retry = status_code in (403, 429, 500, 502, 503, 504) or status_code is None
+
+                if attempt < self.max_retries and should_retry:
+                    sleep_sec = self.base_backoff * attempt + random.uniform(0.1, 0.5)
+                    print(f"[검색 재시도] {keyword}: attempt={attempt}, sleep={sleep_sec:.2f}s, status={status_code}")
+                    time.sleep(sleep_sec)
+                    continue
+                break
+
+        print(f"[검색 요청 실패] {keyword}: {last_error}")
+        return None
+
     def get_news_by_keyword(self, keyword: str, max_count: int = 10) -> List[Dict[str, str]]:
-        """키워드로 네이버 뉴스 검색"""
         try:
             print(f"[검색 크롤링 시작] 키워드: {keyword}")
 
-            url = "https://search.naver.com/search.naver"
-            params = {"where": "news", "sm": "tab_opt", "query": keyword}
+            cached = self._get_cached_news(keyword, max_count)
+            if cached is not None:
+                cached_news, fetched_at = cached
+                self._set_last_meta(keyword, source="cache", fetched_at=fetched_at)
+                self._runtime_stats["cache_hits"] += 1
+                print(f"[검색 캐시 사용] {keyword}: {len(cached_news)}개")
+                return cached_news
 
-            response = requests.get(url, headers=self.headers, params=params, timeout=15)
-            response.raise_for_status()
+            response = self._request_search(keyword)
+            if response is None:
+                stale = self._get_stale_cached_news(keyword, max_count)
+                if stale is not None:
+                    stale_news, fetched_at = stale
+                    self._set_last_meta(keyword, source="stale_cache", fetched_at=fetched_at)
+                    self._runtime_stats["stale_cache_hits"] += 1
+                    print(f"[검색 stale 캐시 fallback] {keyword}: {len(stale_news)}개")
+                    return stale_news
+
+                self._set_last_meta(keyword, source="empty", fetched_at=time.time())
+                self._runtime_stats["empty_results"] += 1
+                return []
 
             soup = BeautifulSoup(response.text, "lxml")
             title_links = self._select_title_links(soup)
@@ -143,11 +303,10 @@ class NaverNewsSearchCrawler:
                     continue
 
                 title = self._normalize_text(link.get("title") or link.get_text(" ", strip=True))
-                if not title or title == "네이버뉴스":
+                if not title or title == "\ub124\uc774\ubc84\ub274\uc2a4":
                     continue
 
                 source, published_date = self._extract_source_and_date(link, href)
-
                 news_item = {
                     "id": f"{keyword}_{len(news_list)}_{int(time.time())}",
                     "title": title,
@@ -160,22 +319,34 @@ class NaverNewsSearchCrawler:
                 news_list.append(news_item)
                 seen_links.add(href)
 
+            fetched_at = time.time()
+            self._set_cache(keyword, max_count, news_list)
+            self._set_last_meta(keyword, source="network", fetched_at=fetched_at)
+            self._runtime_stats["network_fetches"] += 1
+            if not news_list:
+                self._runtime_stats["empty_results"] += 1
             print(f"[검색 크롤링 완료] {keyword}: {len(news_list)}개 뉴스 수집")
             return news_list
 
         except Exception as e:
+            self._runtime_stats["exceptions"] += 1
+            stale = self._get_stale_cached_news(keyword, max_count)
+            if stale is not None:
+                stale_news, fetched_at = stale
+                self._set_last_meta(keyword, source="stale_cache", fetched_at=fetched_at)
+                self._runtime_stats["stale_cache_hits"] += 1
+                print(f"[검색 예외 stale 캐시 fallback] {keyword}: {len(stale_news)}개")
+                return stale_news
+
+            self._set_last_meta(keyword, source="empty", fetched_at=time.time())
+            self._runtime_stats["empty_results"] += 1
             print(f"[검색 크롤링 에러] {keyword}: {e}")
             return []
 
     def _select_title_links(self, soup: BeautifulSoup) -> List[Tag]:
-        """
-        현재 네이버 뉴스 검색 레이아웃 우선, 구형 레이아웃을 fallback으로 지원.
-        """
         links = soup.select("div.group_news a[data-heatmap-target='.tit'][href]")
         if links:
             return links
-
-        # 구형 마크업 fallback
         return soup.select("a.news_tit[href]")
 
     def _is_valid_article_link(self, href: str) -> bool:
@@ -191,7 +362,7 @@ class NaverNewsSearchCrawler:
         source = self._source_from_url(href)
         published_date = "시간 정보 없음"
 
-        # 구형 레이아웃 fallback
+        # Legacy layout fallback.
         parent = title_link.parent
         if parent:
             press_elem = parent.select_one("a.info.press")
@@ -215,7 +386,7 @@ class NaverNewsSearchCrawler:
             text = self._normalize_text(sub.get_text(" ", strip=True))
             if not text:
                 continue
-            if text in ("네이버뉴스", source):
+            if text in ("\ub124\uc774\ubc84\ub274\uc2a4", source):
                 continue
             published_date = text
             break
@@ -223,27 +394,18 @@ class NaverNewsSearchCrawler:
         return source, published_date
 
     def _find_nearest_profile(self, title_link: Tag) -> Optional[Tag]:
-        """
-        title anchor 기준으로 가장 가까운 Profile 블록을 찾아 source/date를 추출.
-        네이버의 해시 클래스명에 의존하지 않기 위해 data-sds-comp 속성만 사용.
-        """
-        # 1) 가장 가까운 상위 블록에서 "직계 자식" Profile 1개를 찾으면 그것을 우선 사용
-        #    (대형 카드/일반 카드 모두 이 규칙으로 정확하게 매칭되는 경우가 많음)
+        # Prefer a direct Profile child in nearest containers first.
         for ancestor in title_link.parents:
             if not isinstance(ancestor, Tag):
                 continue
-
-            direct_profiles = ancestor.find_all(
-                "div", attrs={"data-sds-comp": "Profile"}, recursive=False
-            )
+            direct_profiles = ancestor.find_all("div", attrs={"data-sds-comp": "Profile"}, recursive=False)
             if len(direct_profiles) == 1:
                 return direct_profiles[0]
 
-        # 2) 직계 매칭이 실패하면 기존처럼 동일 상위 블록 내 가장 가까운 Profile을 선택
+        # Fallback to nearest profile by relative distance.
         for ancestor in title_link.parents:
             if not isinstance(ancestor, Tag):
                 continue
-
             profiles = ancestor.select("div[data-sds-comp='Profile']")
             if not profiles:
                 continue
@@ -254,10 +416,7 @@ class NaverNewsSearchCrawler:
             if link_pos is None:
                 continue
 
-            nearest = min(
-                profiles,
-                key=lambda profile: abs(positions.get(id(profile), 10**9) - link_pos),
-            )
+            nearest = min(profiles, key=lambda profile: abs(positions.get(id(profile), 10**9) - link_pos))
             return nearest
 
         return None
@@ -277,13 +436,12 @@ class NaverNewsSearchCrawler:
 
 if __name__ == "__main__":
     crawler = NaverNewsSearchCrawler()
-
-    keyword = "삼성전자"
+    keyword = "\uc0bc\uc131\uc804\uc790"
     print(f"=== '{keyword}' 뉴스 검색 크롤링 테스트 ===")
     news_list = crawler.get_news_by_keyword(keyword, 10)
 
-    for i, news in enumerate(news_list, start=1):
-        print(f"{i}. {news['title']}")
-        print(f"   출처: {news['source']} | 날짜: {news['published_date']}")
+    for idx, news in enumerate(news_list, start=1):
+        print(f"{idx}. {news['title']}")
+        print(f"   출처: {news['source']} | 시간: {news['published_date']}")
         print(f"   링크: {news['link']}")
         print("-" * 80)
